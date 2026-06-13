@@ -56,24 +56,31 @@ function doPost(e) {
   return ContentService.createTextOutput('OK');
 }
 
-// ─── Settings Page Entry Point ──────────────────────────────────
-
 /**
- * Serve the Settings HTML page.
- * Access via the deployed web app URL.
+ * Serve the appropriate HTML page based on the 'page' parameter.
+ * - Default (no param): Dashboard
+ * - ?page=settings:     Settings page
+ * - ?page=api:          API endpoint
  */
 function doGet(e) {
   const page = e && e.parameter && e.parameter.page;
-
+ 
   if (page === 'api') {
-    // API endpoint for settings operations
     return _handleApiGet(e);
   }
-
-  return HtmlService.createHtmlOutputFromFile('Settings')
-    .setTitle('LifeOS — Settings')
+ 
+  if (page === 'settings') {
+    return HtmlService.createHtmlOutputFromFile('Settings')
+      .setTitle('LifeOS — Settings')
+      .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  }
+ 
+  // Default: Dashboard
+  return HtmlService.createHtmlOutputFromFile('Dashboard')
+    .setTitle('LifeOS — Dashboard')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
+ 
 
 // ─── Command Router ─────────────────────────────────────────────
 
