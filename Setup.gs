@@ -1,169 +1,117 @@
 /**
  * Setup.gs
- * First-time setup: creates all sheets with correct headers.
- * Run this ONCE when setting up a new LifeOS spreadsheet.
- *
- * Usage: Open Apps Script editor → Run → setupLifeOS()
+ * Run setupLifeOS() ONCE from the editor. Creates every sheet with headers,
+ * seeds default settings (without overwriting existing values), generates an
+ * API_TOKEN, and records the spreadsheet ID for the bootstrap.
+ * Safe to re-run: it only adds what's missing.
  */
 
-/**
- * Main setup function. Creates all sheets and populates Settings with defaults.
- */
+const DEFAULT_SETTINGS = [
+  // Identity
+  ['USER_NAME', 'Nova', 'Name used in briefs/reviews'],
+  ['LANGUAGE', 'en', 'Response language (en, de, ne)'],
+  ['TIMEZONE', 'Europe/Berlin', 'Timezone for scheduling'],
+  // AI primary (Groq, free)
+  ['AI_PROVIDER', 'groq', 'groq|openrouter|deepseek|grok|openai|mistral|gemini|custom'],
+  ['AI_BASE_URL', 'https://api.groq.com/openai/v1', 'OpenAI-compatible base URL (ignored for gemini)'],
+  ['AI_API_KEY', '', 'API key for the active provider'],
+  ['AI_MODEL', 'llama-3.3-70b-versatile', 'Model name'],
+  ['AI_TEMPERATURE_PARSE', '0.2', 'Temp for categorize/parse'],
+  ['AI_TEMPERATURE_PLAN', '0.7', 'Temp for plans/reviews'],
+  // AI fallback (OpenRouter, free)
+  ['AI_FALLBACK_PROVIDER', 'openrouter', 'Secondary provider used on 429'],
+  ['AI_FALLBACK_BASE_URL', 'https://openrouter.ai/api/v1', 'Fallback base URL'],
+  ['AI_FALLBACK_API_KEY', '', 'Fallback key'],
+  ['AI_FALLBACK_MODEL', 'openrouter/free', 'Fallback model (auto-router)'],
+  // Voice & Vision (free)
+  ['VOICE_PROVIDER', 'groq', 'Transcription provider'],
+  ['VOICE_API_KEY', '', 'Defaults to AI_API_KEY if blank'],
+  ['VOICE_MODEL', 'whisper-large-v3', 'Whisper model'],
+  ['VISION_PROVIDER', 'openrouter', 'Image-understanding provider'],
+  ['VISION_API_KEY', '', 'Defaults to fallback key if blank'],
+  ['VISION_MODEL', 'qwen/qwen-2-vl-7b-instruct:free', 'Free vision model'],
+  // Messaging (Telegram default)
+  ['MSG_PROVIDER', 'telegram', 'telegram|slack|whatsapp'],
+  ['TELEGRAM_BOT_TOKEN', '', 'From @BotFather'],
+  ['TELEGRAM_CHAT_ID', '', 'Your Telegram chat ID'],
+  ['SLACK_BOT_TOKEN', '', 'xoxb- token'],
+  ['SLACK_SIGNING_SECRET', '', 'Slack signing secret'],
+  ['SLACK_CHANNEL_ID', '', 'Target channel/DM'],
+  ['WHATSAPP_TOKEN', '', 'Meta Cloud API token'],
+  ['WHATSAPP_PHONE_ID', '', 'Phone number ID'],
+  ['WHATSAPP_TO', '', 'Your number'],
+  // n8n / API
+  ['API_TOKEN', '', 'Bearer token for ?api=1 (auto-generated)'],
+  ['N8N_ENABLED', 'false', 'Fire domain events to n8n'],
+  ['N8N_WEBHOOK_URL', '', 'n8n inbound webhook'],
+  // Domains
+  ['DOMAINS', 'studies,german,freelance,jobsearch,studentwerk,health,personal', 'Configurable life domains'],
+  ['DEFAULT_DOMAIN', 'personal', 'Fallback domain'],
+  ['DOMAIN_WEIGHTS', 'studies:5,german:5,freelance:4,jobsearch:3,studentwerk:3,health:3,personal:1', 'Brief/review weighting'],
+  // Schedule (used from Phase 4+)
+  ['MORNING_BRIEF_HOUR', '8', '0-23'],
+  ['GERMAN_QUIZ_HOUR', '9', 'Daily vocab quiz hour'],
+  ['GERMAN_NEW_WORDS_PER_DAY', '15', 'New A2 words/day'],
+  ['NIGHT_REVIEW_HOUR', '22', '0-23'],
+  ['WEEKLY_REVIEW_DAY', '0', '0=Sun..6=Sat'],
+  ['WEEKLY_REVIEW_HOUR', '20', '0-23'],
+  // Calendars
+  ['CALENDAR_ID_CLASSES', 'primary', ''],
+  ['CALENDAR_ID_STUDY', 'primary', ''],
+  ['CALENDAR_ID_CAREER', 'primary', ''],
+  ['CALENDAR_ID_PERSONAL', 'primary', ''],
+  ['CALENDAR_ID_HEALTH', 'primary', ''],
+  // Defaults & features
+  ['DEFAULT_TASK_DURATION', '30', 'Minutes'],
+  ['DEFAULT_PRIORITY', 'medium', 'high|medium|low'],
+  ['POMODORO_FOCUS_MIN', '25', 'Focus block length'],
+  ['POMODORO_BREAK_MIN', '5', 'Break length'],
+  ['GAMIFICATION_ENABLED', 'true', 'XP/levels/streaks'],
+  ['AI_CATEGORIZE', 'true', 'Auto-categorize inbox'],
+  ['AI_SUMMARIZE', 'true', 'Auto-summarize long inputs'],
+  ['SMART_RESCHEDULE', 'true', 'Auto-shift overloaded days']
+];
+
+// Sheet creation order
+const SETUP_SHEETS = ['Inbox', 'Tasks', 'Projects', 'Events', 'Goals', 'Habits', 'Ideas', 'Learning', 'Vocab', 'Applications', 'Health', 'Sessions', 'Reviews', 'Stats', 'Settings'];
+
 function setupLifeOS() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  if (!ss) {
-    throw new Error('This script must be bound to a Google Spreadsheet. Open a spreadsheet, then Extensions → Apps Script.');
-  }
-
-  // Store spreadsheet ID in script properties (bootstrap for Config.gs)
   PropertiesService.getScriptProperties().setProperty('SPREADSHEET_ID', ss.getId());
 
-  // Create all sheets
-  _createSheet(ss, 'Inbox', ['ID', 'Timestamp', 'Source', 'RawContent', 'AI_Summary', 'Category', 'Priority', 'Status']);
-  _createSheet(ss, 'Tasks', ['ID', 'CreatedAt', 'Title', 'Description', 'Priority', 'Energy', 'Duration', 'DueDate', 'Status', 'GoalID', 'CalendarEventID', 'CompletedAt']);
-  _createSheet(ss, 'Events', ['ID', 'Title', 'StartTime', 'EndTime', 'CalendarID', 'Category', 'Status']);
-  _createSheet(ss, 'Goals', ['GoalID', 'GoalType', 'Title', 'Description', 'Deadline', 'Progress', 'Status']);
-  _createSheet(ss, 'Habits', ['ID', 'Name', 'Frequency', 'TimeOfDay', 'Streak', 'TotalDone', 'LastDone', 'Status']);
-  _createSheet(ss, 'Ideas', ['ID', 'Timestamp', 'RawContent', 'AI_Summary', 'Category', 'Tags', 'Score', 'Status']);
-  _createSheet(ss, 'Learning', ['ID', 'Timestamp', 'Topic', 'Content', 'Source', 'Tags']);
-  _createSheet(ss, 'Reviews', ['ID', 'Date', 'Type', 'TasksCompleted', 'TasksPlanned', 'CompletionRate', 'AI_Summary', 'Mood', 'Notes']);
-  _createSheet(ss, 'Settings', ['Key', 'Value', 'Description', 'UpdatedAt']);
-
-  // Populate default settings
-  _populateDefaultSettings(ss);
-
-  // Format header rows
-  _formatHeaders(ss);
-
-  // Remove the default "Sheet1" if it exists and is empty
-  const sheet1 = ss.getSheetByName('Sheet1');
-  if (sheet1 && sheet1.getLastRow() <= 1) {
-    try { ss.deleteSheet(sheet1); } catch (e) { /* can't delete last sheet */ }
-  }
-
-  log('Setup', 'LifeOS setup complete', { spreadsheetId: ss.getId() });
-
-  SpreadsheetApp.getUi().alert(
-    '✅ LifeOS Setup Complete!\n\n' +
-    'Next steps:\n' +
-    '1. Go to the Settings sheet and fill in your Telegram Bot Token, Chat ID, and Gemini API Key\n' +
-    '2. Deploy as web app (Deploy → New deployment → Web app → Execute as: Me, Access: Anyone)\n' +
-    '3. Copy the web app URL\n' +
-    '4. Open the web app URL in your browser to access the Settings page\n' +
-    '5. Use the Settings page to set up the Telegram webhook and install triggers'
-  );
-}
-
-/**
- * Create a sheet with headers if it doesn't exist.
- * Doesn't overwrite existing sheets.
- */
-function _createSheet(ss, name, headers) {
-  let sheet = ss.getSheetByName(name);
-  if (sheet) {
-    // Sheet exists — check if headers match
-    const existing = sheet.getRange(1, 1, 1, sheet.getMaxColumns()).getValues()[0];
-    const existingClean = existing.map(h => String(h).trim()).filter(h => h);
-    if (existingClean.length === 0) {
-      // Empty sheet — add headers
-      sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    }
-    return sheet;
-  }
-
-  sheet = ss.insertSheet(name);
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  return sheet;
-}
-
-/**
- * Populate the Settings sheet with default values.
- */
-function _populateDefaultSettings(ss) {
-  const sheet = ss.getSheetByName('Settings');
-  const existingData = sheet.getDataRange().getValues();
-
-  // Check if settings already exist
-  if (existingData.length > 1) return; // Already populated
-
-  const defaults = [
-    ['TELEGRAM_BOT_TOKEN', '', 'Telegram Bot API token from @BotFather', ''],
-    ['TELEGRAM_CHAT_ID', '', 'Your Telegram user/chat ID (send /start to @userinfobot)', ''],
-    ['GEMINI_API_KEY', '', 'Google AI Studio API key (aistudio.google.com)', ''],
-    ['SPREADSHEET_ID', ss.getId(), 'This spreadsheet ID (auto-filled)', new Date()],
-    ['MORNING_BRIEF_HOUR', '8', 'Hour for morning brief (0-23)', ''],
-    ['MORNING_BRIEF_MINUTE', '0', 'Minute for morning brief (0-59)', ''],
-    ['NIGHT_REVIEW_HOUR', '22', 'Hour for night review', ''],
-    ['NIGHT_REVIEW_MINUTE', '0', 'Minute for night review', ''],
-    ['WEEKLY_REVIEW_DAY', '0', 'Day for weekly review (0=Sun, 1=Mon, ...6=Sat)', ''],
-    ['WEEKLY_REVIEW_HOUR', '20', 'Hour for weekly review', ''],
-    ['TIMEZONE', 'Europe/Berlin', 'Timezone for all scheduling', ''],
-    ['DEFAULT_TASK_DURATION', '30', 'Default task duration in minutes', ''],
-    ['DEFAULT_PRIORITY', 'medium', 'Default priority for new items (high/medium/low)', ''],
-    ['CALENDAR_ID_CLASSES', 'primary', 'Google Calendar ID for classes', ''],
-    ['CALENDAR_ID_STUDY', 'primary', 'Google Calendar ID for study blocks', ''],
-    ['CALENDAR_ID_CAREER', 'primary', 'Google Calendar ID for career/work', ''],
-    ['CALENDAR_ID_PERSONAL', 'primary', 'Google Calendar ID for personal', ''],
-    ['CALENDAR_ID_HEALTH', 'primary', 'Google Calendar ID for health', ''],
-    ['AI_MODEL', 'gemini-2.0-flash', 'Gemini model (gemini-2.0-flash or gemini-1.5-pro)', ''],
-    ['AI_CATEGORIZE', 'true', 'Auto-categorize inbox items with AI', ''],
-    ['AI_SUMMARIZE', 'true', 'Auto-summarize long inputs', ''],
-    ['AI_DAILY_PLAN', 'true', 'Generate AI-powered daily plans', ''],
-    ['LANGUAGE', 'en', 'Response language (en, de, ne)', '']
-  ];
-
-  defaults.forEach(row => {
-    sheet.appendRow(row);
+  let created = 0;
+  SETUP_SHEETS.forEach(name => {
+    let sh = ss.getSheetByName(name);
+    if (!sh) { sh = ss.insertSheet(name); created++; }
+    const headers = name === 'Settings' ? SCHEMA.Settings : SCHEMA[name];
+    // (Re)write header row and format
+    sh.getRange(1, 1, 1, headers.length).setValues([headers])
+      .setFontWeight('bold').setBackground('#1f2433').setFontColor('#e6e8ee');
+    sh.setFrozenRows(1);
   });
-}
 
-/**
- * Format header rows (bold, freeze, color).
- */
-function _formatHeaders(ss) {
-  const sheetNames = ['Inbox', 'Tasks', 'Events', 'Goals', 'Habits', 'Ideas', 'Learning', 'Reviews', 'Settings'];
-
-  sheetNames.forEach(name => {
-    const sheet = ss.getSheetByName(name);
-    if (!sheet) return;
-
-    const headerRange = sheet.getRange(1, 1, 1, sheet.getLastColumn());
-    headerRange.setFontWeight('bold');
-    headerRange.setBackground('#2D2D2D');
-    headerRange.setFontColor('#FFFFFF');
-    sheet.setFrozenRows(1);
-
-    // Auto-resize columns
-    for (let c = 1; c <= sheet.getLastColumn(); c++) {
-      sheet.autoResizeColumn(c);
-    }
-  });
-}
-
-/**
- * Quick setup test — verifies sheets exist and settings are populated.
- */
-function verifySetup() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const required = ['Inbox', 'Tasks', 'Events', 'Goals', 'Habits', 'Ideas', 'Learning', 'Reviews', 'Settings'];
-  const missing = required.filter(name => !ss.getSheetByName(name));
-
-  if (missing.length) {
-    return `❌ Missing sheets: ${missing.join(', ')}. Run setupLifeOS() first.`;
+  // Seed default settings (skip keys that already exist)
+  const settingsSheet = ss.getSheetByName('Settings');
+  const existing = {};
+  if (settingsSheet.getLastRow() >= 2) {
+    settingsSheet.getRange(2, 1, settingsSheet.getLastRow() - 1, 1).getValues().forEach(r => { existing[String(r[0]).trim()] = true; });
+  }
+  const toAdd = DEFAULT_SETTINGS.filter(([k]) => !existing[k]).map(([k, v, d]) => [k, v, d, new Date()]);
+  if (toAdd.length) {
+    settingsSheet.getRange(settingsSheet.getLastRow() + 1, 1, toAdd.length, 4).setValues(toAdd);
   }
 
-  const token = getConfig('TELEGRAM_BOT_TOKEN');
-  const chatId = getConfig('TELEGRAM_CHAT_ID');
-  const geminiKey = getConfig('GEMINI_API_KEY');
-
-  const issues = [];
-  if (!token) issues.push('TELEGRAM_BOT_TOKEN not set');
-  if (!chatId) issues.push('TELEGRAM_CHAT_ID not set');
-  if (!geminiKey) issues.push('GEMINI_API_KEY not set');
-
-  if (issues.length) {
-    return `⚠️ Setup incomplete:\n${issues.join('\n')}`;
+  // Generate API token if missing
+  clearConfigCache();
+  if (!getConfig('API_TOKEN')) {
+    setConfig('API_TOKEN', Utilities.getUuid().replace(/-/g, ''));
   }
 
-  return '✅ All good! LifeOS is ready.';
+  // Remove the default empty sheet if present
+  const def = ss.getSheetByName('Sheet1');
+  if (def && SETUP_SHEETS.indexOf('Sheet1') === -1) { try { ss.deleteSheet(def); } catch (e) {} }
+
+  const summary = `LifeOS setup complete.\n• ${created} sheet(s) created (${SETUP_SHEETS.length} total)\n• ${toAdd.length} default settings added\n\nNext:\n1. Fill AI_API_KEY + TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in the Settings sheet\n2. Deploy as Web App (Execute as Me, Access: Anyone)\n3. Run connectBot() to set the Telegram webhook`;
+  try { SpreadsheetApp.getUi().alert(summary); } catch (e) { log('Setup', summary); }
+  return summary;
 }

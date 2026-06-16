@@ -1,108 +1,76 @@
 /**
  * Config.gs
- * Reads configuration from the Settings sheet.
- * All other files call getConfig('KEY') to access settings.
- * Settings are cached per execution to avoid repeated sheet reads.
+ * Reads/writes the Settings sheet. Cached per execution.
+ * Bootstrap spreadsheet ID lives in ScriptProperties (set during Setup).
  */
 
 let _configCache = null;
 
-/**
- * Get a config value by key from the Settings sheet.
- * @param {string} key - The setting key name
- * @param {string} [fallback] - Default value if key not found
- * @returns {string} The setting value
- */
 function getConfig(key, fallback = '') {
-  if (!_configCache) {
-    _loadConfigCache();
-  }
-  return _configCache[key] !== undefined ? _configCache[key] : fallback;
+  if (!_configCache) _loadConfigCache();
+  const v = _configCache[key];
+  return (v === undefined || v === '') ? fallback : v;
 }
 
-/**
- * Get a config value as a number.
- */
 function getConfigNumber(key, fallback = 0) {
-  const val = getConfig(key, String(fallback));
-  const num = Number(val);
-  return isNaN(num) ? fallback : num;
+  const n = Number(getConfig(key, String(fallback)));
+  return isNaN(n) ? fallback : n;
 }
 
-/**
- * Get a config value as a boolean.
- */
 function getConfigBool(key, fallback = false) {
-  const val = getConfig(key, String(fallback));
-  return val === 'true' || val === '1' || val === 'yes';
+  const v = getConfig(key, String(fallback));
+  return v === 'true' || v === '1' || v === 'yes' || v === true;
 }
 
-/**
- * Load all settings into memory cache.
- */
+/** Configured life domains as an array. */
+function getDomains() {
+  return getConfig('DOMAINS', 'personal').split(',').map(s => s.trim()).filter(Boolean);
+}
+
 function _loadConfigCache() {
   _configCache = {};
   try {
-    const ss = _getSpreadsheet();
-    const sheet = ss.getSheetByName('Settings');
-    if (!sheet) return;
-    const data = sheet.getDataRange().getValues();
-    // Skip header row
-    for (let i = 1; i < data.length; i++) {
-      const key = String(data[i][0]).trim();
-      const value = String(data[i][1]).trim();
-      if (key) {
-        _configCache[key] = value;
-      }
-    }
+    const sheet = getSpreadsheet().getSheetByName('Settings');
+    if (!sheet || sheet.getLastRow() < 2) return;
+    const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+    data.forEach(([k, v]) => {
+      const key = String(k).trim();
+      if (key) _configCache[key] = String(v).trim();
+    });
   } catch (e) {
     console.error('Config load failed:', e.message);
   }
 }
 
-/**
- * Update a config value in the Settings sheet.
- * Also updates the cache and the UpdatedAt column.
- */
+/** Write a single setting (updates cache + UpdatedAt). */
 function setConfig(key, value) {
-  try {
-    const ss = _getSpreadsheet();
-    const sheet = ss.getSheetByName('Settings');
-    if (!sheet) return;
-    const data = sheet.getDataRange().getValues();
-    for (let i = 1; i < data.length; i++) {
-      if (String(data[i][0]).trim() === key) {
-        sheet.getRange(i + 1, 2).setValue(value);
-        sheet.getRange(i + 1, 4).setValue(new Date());
-        if (_configCache) _configCache[key] = String(value);
-        return;
-      }
+  const sheet = getSpreadsheet().getSheetByName('Settings');
+  if (!sheet) return;
+  const keys = sheet.getRange(2, 1, Math.max(sheet.getLastRow() - 1, 1), 1).getValues();
+  for (let i = 0; i < keys.length; i++) {
+    if (String(keys[i][0]).trim() === key) {
+      sheet.getRange(i + 2, 2).setValue(value);
+      sheet.getRange(i + 2, 4).setValue(new Date());
+      if (_configCache) _configCache[key] = String(value);
+      return;
     }
-    // Key doesn't exist yet — add it
-    sheet.appendRow([key, value, '', new Date()]);
-    if (_configCache) _configCache[key] = String(value);
-  } catch (e) {
-    console.error('Config save failed:', e.message);
   }
+  sheet.appendRow([key, value, '', new Date()]);
+  if (_configCache) _configCache[key] = String(value);
 }
 
-/**
- * Get the main spreadsheet. Uses SPREADSHEET_ID from script properties
- * as a bootstrap (since we can't read the sheet to get the sheet ID).
- */
-function _getSpreadsheet() {
-  // First try script property (set during setup)
-  const propId = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
-  if (propId) {
-    return SpreadsheetApp.openById(propId);
-  }
-  // Fallback: the spreadsheet this script is bound to
-  return SpreadsheetApp.getActiveSpreadsheet();
+/** Bulk write settings. */
+function setConfigs(obj) {
+  Object.entries(obj || {}).forEach(([k, v]) => setConfig(k, v));
 }
 
-/**
- * Returns the spreadsheet for use by other modules.
- */
+/** Reset the per-execution config cache (call after bulk writes). */
+function clearConfigCache() { _configCache = null; }
+
+// ─── Spreadsheet bootstrap ───────────────────────────────────────
+
 function getSpreadsheet() {
-  return _getSpreadsheet();
+  const id = PropertiesService.getScriptProperties().getProperty('SPREADSHEET_ID');
+  if (id) return SpreadsheetApp.openById(id);
+  return SpreadsheetApp.getActiveSpreadsheet();
 }
