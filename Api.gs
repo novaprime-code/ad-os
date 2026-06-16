@@ -58,11 +58,30 @@ const API_ROUTES = {
   'tasks.list': (p) => Container.taskService().list(p.filter, p.domain),
   'tasks.create': (p) => p.text ? Container.taskService().createFromText(p.text) : Container.taskService().create(p),
   'tasks.complete': (p) => Container.taskService().complete(p.id),
+  'tasks.focus': () => Container.taskService().focus(),
+  'tasks.subtask': (p) => Container.taskService().createSubtask(p.parentId, p.text),
+  'tasks.depend': (p) => Container.taskService().setDependency(p.id, p.dependsOn),
+  'tasks.wait': (p) => Container.taskService().setWaiting(p.id, p.who),
+  'tasks.recur': (p) => Container.taskService().setRecurrence(p.id, p.rule),
 
   // ── ideas / learning ──
   'ideas.list': () => Container.ideaService().list(),
   'ideas.create': (p) => Container.ideaService().create(p.text),
+  'learning.list': () => ok(Container.repos().learning.all()),
   'learning.create': (p) => Container.learningService().create(p.text, p.topic),
+
+  // ── read-only lists for SPA views ──
+  'events.today': () => ok(getTodayEvents()),
+  'projects.list': () => ok(Container.repos().projects.active()),
+  'goals.list': () => ok(Container.repos().goals.active()),
+  'habits.list': () => ok(Container.repos().habits.active()),
+
+  // ── vocab (German A1→A2, SM-2) ──
+  'vocab.due': () => Container.vocabService().due(),
+  'vocab.add': (p) => Container.vocabService().add(p.term, p.translation, p.example, p.level),
+  'vocab.review': (p) => Container.vocabService().review(p.id, p.quality),
+  'vocab.stats': () => ok(Container.vocabService().stats()),
+  'vocab.seed': (p) => ok({ added: Container.vocabService().seedNewWords(p.n) }),
 
   // ── search / stats ──
   'search.global': (p) => Container.searchService().global(p.query),
@@ -95,4 +114,4 @@ function _testProvider(target) {
   } catch (e) { return fail('TEST_FAILED', e.message); }
 }
 
-function getWebAppUrl() { return ScriptApp.getService().getUrl(); }
+function getWebAppUrl() { return getConfig('WEBAPP_URL') || ScriptApp.getService().getUrl(); }

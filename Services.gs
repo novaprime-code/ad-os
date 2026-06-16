@@ -191,31 +191,109 @@ class TaskService extends BaseService {
     const t = this.repos.tasks.find(id);
     if (!t) return fail('NOT_FOUND', `Task ${id} not found`);
     this.repos.tasks.update(id, { Status: 'done', CompletedAt: now() });
-    // remove linked calendar event if present
     if (t.CalendarEventID) {
       try { CalendarApp.getEventById(t.CalendarEventID).deleteEvent(); } catch (e) {}
     }
     Container.statsService().award('task.done', t.Priority === 'high' ? 15 : 10);
     this.emit('task.done', { id, title: t.Title, domain: t.Domain });
-    return ok({ id, title: t.Title });
+
+    // Recurring → spawn the next instance
+    let spawned = null;
+    if (t.Recurrence && t.Recurrence !== 'none' && t.Recurrence !== '') {
+      const base = toDate(t.DueDate);
+      const from = (base && base > getStartOfToday()) ? base : getStartOfToday();
+      const next = nextRecurrenceDate(t.Recurrence, from);
+      spawned = this.repos.tasks.create({
+        CreatedAt: now(), Title: t.Title, Description: t.Description, Priority: t.Priority,
+        Energy: t.Energy, Duration: t.Duration, DueDate: next, Status: 'todo', Domain: t.Domain,
+        ProjectID: t.ProjectID, GoalID: t.GoalID, ParentTaskID: '', DependsOn: '',
+        Recurrence: t.Recurrence, RecurrenceConfig: t.RecurrenceConfig, WaitingOn: '',
+        CalendarEventID: '', CompletedAt: ''
+      });
+    }
+    return ok({ id, title: t.Title, recurredTo: spawned && spawned.ID, nextDue: spawned && spawned.DueDate });
+  }
+
+  /** Add a subtask under a parent (inherits domain/project). */
+  createSubtask(parentId, text) {
+    const parent = this.repos.tasks.find(parentId);
+    if (!parent) return fail('NOT_FOUND', `Parent ${parentId} not found`);
+    if (!text) return fail('EMPTY', 'No subtask text');
+    const ai = getConfigBool('AI_CATEGORIZE', true) ? aiCategorize(text) : null;
+    const dto = _taskDtoFromAI(text, ai);
+    dto.ParentTaskID = parentId;
+    dto.Domain = parent.Domain || dto.Domain;
+    dto.ProjectID = parent.ProjectID || '';
+    const t = this.repos.tasks.create(dto);
+    this.emit('task.created', { id: t.ID, parent: parentId });
+    return ok(t);
+  }
+
+  setDependency(id, dependsOnId) {
+    if (!this.repos.tasks.find(id)) return fail('NOT_FOUND', `Task ${id} not found`);
+    if (!this.repos.tasks.find(dependsOnId)) return fail('NOT_FOUND', `Blocker ${dependsOnId} not found`);
+    this.repos.tasks.update(id, { DependsOn: dependsOnId });
+    return ok({ id, dependsOn: dependsOnId });
+  }
+
+  setWaiting(id, who) {
+    if (!this.repos.tasks.find(id)) return fail('NOT_FOUND', `Task ${id} not found`);
+    this.repos.tasks.update(id, { Status: 'waiting', WaitingOn: who || '' });
+    return ok({ id, waitingOn: who || '' });
+  }
+
+  setRecurrence(id, rule) {
+    const valid = ['none', 'daily', 'weekdays', 'weekly', 'monthly'];
+    rule = String(rule || '').toLowerCase();
+    if (!valid.includes(rule)) return fail('BAD_RULE', `Use one of: ${valid.join(', ')}`);
+    if (!this.repos.tasks.find(id)) return fail('NOT_FOUND', `Task ${id} not found`);
+    this.repos.tasks.update(id, { Recurrence: rule });
+    return ok({ id, recurrence: rule });
+  }
+
+  /** A task is blocked if its DependsOn target exists and isn't done. */
+  _isBlocked(t) {
+    if (!t.DependsOn) return false;
+    const dep = this.repos.tasks.find(t.DependsOn);
+    return !!(dep && dep.Status !== 'done');
+  }
+
+  /** Single best next action: highest-ranked open, non-blocked task. */
+  focus() {
+    const rows = this.repos.tasks.open().filter(t => !this._isBlocked(t));
+    rows.sort((a, b) => _taskRank(b) - _taskRank(a));
+    return ok(rows[0] || null);
   }
 
   list(filter, domain) {
     let rows = this.repos.tasks.open();
-    if (filter === 'all') rows = this.repos.tasks.all().filter(t => t.Status !== 'archived');
+    if (filter === 'all') rows = this.repos.tasks.all().filter(t => t.Status !== 'archived' && t.Status !== 'done');
     else if (filter === 'high') rows = rows.filter(t => t.Priority === 'high');
     else if (filter === 'waiting') rows = this.repos.tasks.waiting();
-    else if (filter === 'overdue') {
-      const end = getEndOfToday();
-      rows = rows.filter(t => toDate(t.DueDate) && toDate(t.DueDate) < getStartOfToday());
-    } else if (filter === 'today' || !filter) {
+    else if (filter === 'overdue') rows = rows.filter(t => toDate(t.DueDate) && toDate(t.DueDate) < getStartOfToday());
+    else if (filter === 'today' || !filter) {
       const end = getEndOfToday();
       rows = rows.filter(t => !t.DueDate || (toDate(t.DueDate) && toDate(t.DueDate) <= end));
     }
     if (domain) rows = rows.filter(t => t.Domain === domain);
-    rows.sort((a, b) => _taskRank(b) - _taskRank(a));
+    // annotate (clone to avoid mutating cached rows); blocked sinks to the bottom
+    rows = rows.map(t => Object.assign({}, t, { _blocked: this._isBlocked(t), _hasParent: !!t.ParentTaskID }));
+    rows.sort((a, b) => (a._blocked - b._blocked) || (_taskRank(b) - _taskRank(a)));
     return ok(rows);
   }
+}
+
+/** Compute the next due date for a recurrence rule from a base date. */
+function nextRecurrenceDate(rule, from) {
+  const d = new Date(from);
+  switch (String(rule).toLowerCase()) {
+    case 'weekly': d.setDate(d.getDate() + 7); break;
+    case 'monthly': d.setMonth(d.getMonth() + 1); break;
+    case 'weekdays': do { d.setDate(d.getDate() + 1); } while (d.getDay() === 0 || d.getDay() === 6); break;
+    case 'daily': default: d.setDate(d.getDate() + 1);
+  }
+  d.setHours(23, 59, 0, 0);
+  return d;
 }
 
 const PRIORITY_SCORE = { high: 3, medium: 2, low: 1 };

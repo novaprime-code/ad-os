@@ -43,6 +43,7 @@ const Container = (function () {
   const learningService = () => once('learningService', () => new LearningService(repos()));
   const searchService = () => once('searchService', () => new SearchService(repos()));
   const statsService = () => once('statsService', () => new GamificationService(repos()));
+  const vocabService = () => once('vocabService', () => new VocabService(repos()));
 
   function reset() { _c = {}; clearConfigCache(); Cache.invalidateAll(); }
 
@@ -50,7 +51,7 @@ const Container = (function () {
     repos,
     tasks: () => repos().tasks,
     ai, messaging,
-    inboxService, taskService, ideaService, learningService, searchService, statsService,
+    inboxService, taskService, ideaService, learningService, searchService, statsService, vocabService,
     reset
   };
 })();

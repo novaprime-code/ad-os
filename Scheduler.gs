@@ -17,8 +17,10 @@ function _clearTriggers() {
  */
 function installTriggers() {
   _clearTriggers();
-  // No time-based features in Phase 0/1 — capture is event-driven via the webhook.
-  return 'Triggers cleared. No scheduled jobs in this phase (briefs/reviews/quiz arrive in Phases 4–6).';
+  const tzv = getConfig('TIMEZONE', 'Europe/Berlin');
+  const hour = getConfigNumber('GERMAN_QUIZ_HOUR', 9);
+  ScriptApp.newTrigger('onGermanQuiz').timeBased().atHour(hour).everyDays(1).inTimezone(tzv).create();
+  return `Installed: daily German quiz at ${hour}:00 (${tzv}). Briefs & reviews arrive in Phases 4–5.`;
 }
 
 /** Set the messaging webhook to this deployment's URL. Run after each new deploy. */
