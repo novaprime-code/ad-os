@@ -1,15 +1,16 @@
 /**
- * Inbox.gs
+ * Inbox.gs (v2)
  * Handles incoming messages that aren't explicit commands.
- * Captures to Inbox, triggers AI categorization, routes to appropriate sheet.
+ * v2 additions: returns inboxId for triage buttons, convertInboxItem()
+ * for one-tap "→ Task / → Idea / Archive" triage.
  */
 
 /**
  * Process a raw text message into the Inbox.
  * AI categorizes it and routes to the right sheet if applicable.
  * @param {string} text - Raw user input
- * @param {string} [source='telegram'] - Input source
- * @returns {Object} Result with category and confirmation message
+ * @param {string} [source='telegram'] - Input source ('telegram', 'voice', 'photo')
+ * @returns {Object} { category, summary, priority, message, routeResult, inboxId }
  */
 function processInboxItem(text, source = 'telegram') {
   const id = generateId('INB');
@@ -60,7 +61,7 @@ function processInboxItem(text, source = 'telegram') {
       routeResult = _routeToLearning(text, aiResult);
       break;
     default:
-      // Stay as note in Inbox
+      // Stays as note in Inbox — caller may attach triage buttons
       break;
   }
 
@@ -84,8 +85,41 @@ function processInboxItem(text, source = 'telegram') {
     summary,
     priority,
     message: confirmMsg,
-    routeResult
+    routeResult,
+    inboxId: id
   };
+}
+
+/**
+ * Triage an inbox item via button press: convert to task/idea or archive.
+ * Used by callback data "triage:<target>:<INB-ID>".
+ * @param {string} inboxId
+ * @param {string} target - 'task' | 'idea' | 'archive'
+ * @returns {string} Confirmation message
+ */
+function convertInboxItem(inboxId, target) {
+  const item = findRow('Inbox', 'ID', String(inboxId).toUpperCase());
+  if (!item) return `❌ Inbox item not found: <code>${escapeHtml(inboxId)}</code>`;
+
+  const text = item.RawContent || '';
+
+  switch (target) {
+    case 'task': {
+      const result = _routeToTask(text, null);
+      updateRow('Inbox', item._rowIndex, { 'Category': 'task', 'Status': 'processed' });
+      return `📝 Converted to task\n<b>${escapeHtml(truncate(text, 80))}</b>\n<code>${result.id}</code>`;
+    }
+    case 'idea': {
+      const result = _routeToIdea(text, null);
+      updateRow('Inbox', item._rowIndex, { 'Category': 'idea', 'Status': 'processed' });
+      return `💡 Converted to idea\n<b>${escapeHtml(truncate(text, 80))}</b>\n<code>${result.id}</code>`;
+    }
+    case 'archive':
+      updateRow('Inbox', item._rowIndex, { 'Status': 'archived' });
+      return `🗄 Archived.`;
+    default:
+      return '❓ Unknown triage action.';
+  }
 }
 
 /**
@@ -132,7 +166,7 @@ function _routeToIdea(text, aiResult) {
     parsed.summary || truncate(text, 80),
     parsed.tags ? _guessIdeaCategory(parsed.tags) : 'other',
     parsed.tags || '',
-    '',  // Score (can be filled later)
+    '',  // Score
     'new'
   ]);
 
@@ -143,17 +177,15 @@ function _routeToIdea(text, aiResult) {
  * Route categorized input to calendar.
  */
 function _routeToEvent(text, aiResult) {
-  // Use Gemini to parse event details
   const eventData = parseEventText(text);
   if (!eventData || !eventData.startDate || !eventData.startTime) {
-    // Couldn't parse — save as note instead
     return { extra: '⚠️ Could not parse event time. Saved as note.' };
   }
 
   const startTime = new Date(`${eventData.startDate}T${eventData.startTime}`);
   const endTime = eventData.endTime
     ? new Date(`${eventData.startDate}T${eventData.endTime}`)
-    : new Date(startTime.getTime() + 60 * 60000); // Default 1 hour
+    : new Date(startTime.getTime() + 60 * 60000);
 
   const eventId = createCalendarEvent({
     title: eventData.title || truncate(text, 50),
@@ -164,7 +196,6 @@ function _routeToEvent(text, aiResult) {
   });
 
   if (eventId) {
-    // Also track in Events sheet
     const evtId = generateId('EVT');
     appendRow('Events', [
       evtId,
@@ -195,10 +226,11 @@ function _routeToLearning(text, aiResult) {
   appendRow('Learning', [
     learnId,
     now(),
-    parsed.tags || 'general',
+    parsed.tags ? String(parsed.tags).split(',')[0].trim() : 'general',
     text,
     'telegram',
-    parsed.tags || ''
+    parsed.tags || '',
+    '', 0, 0  // NextReview, Interval, Reps (spaced repetition)
   ]);
 
   return { id: learnId };
@@ -208,7 +240,7 @@ function _routeToLearning(text, aiResult) {
  * Guess idea category from tags.
  */
 function _guessIdeaCategory(tags) {
-  const t = tags.toLowerCase();
+  const t = String(tags).toLowerCase();
   if (t.includes('business') || t.includes('saas') || t.includes('startup')) return 'business';
   if (t.includes('project') || t.includes('code') || t.includes('app')) return 'project';
   if (t.includes('learn') || t.includes('study') || t.includes('course')) return 'learning';

@@ -1,7 +1,8 @@
 /**
- * Gemini.gs
+ * Gemini.gs (v2)
  * AI layer using Google Gemini API.
- * Handles categorization, summarization, planning, and natural language parsing.
+ * v2 additions: multimodal calls (voice transcription, image analysis),
+ * goal parsing prompt.
  */
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/';
@@ -120,16 +121,40 @@ Text: "{{TEXT}}"
 Respond ONLY with valid JSON:
 {"title":"...","startDate":"YYYY-MM-DD","startTime":"HH:MM","endTime":"HH:MM","category":"class|study|career|personal|health"}`;
 
+const PROMPT_PARSE_GOAL = `Extract goal details from this text. Current date: {{DATE}}, timezone: {{TIMEZONE}}.
 
-// ─── API Call ───────────────────────────────────────────────────
+Text: "{{TEXT}}"
+
+Respond ONLY with valid JSON:
+{"title":"short clean goal title","goalType":"academic|career|health|personal|financial","deadline":"YYYY-MM-DD or null"}`;
+
+const PROMPT_TRANSCRIBE = `Transcribe this voice note exactly as spoken.
+The speaker may mix English, German, and Nepali.
+Output ONLY the transcription text — no labels, no commentary, no quotes.`;
+
+const PROMPT_IMAGE_ANALYZE = `You are processing an image sent to a personal productivity system.
+Describe what is actionable or worth remembering in this image.
+If it contains text (screenshot, whiteboard, document, handwriting), extract the text.
+If it shows a schedule, deadline, or appointment, state it clearly with dates/times.
+Be concise (under 100 words). Output plain text only.
+{{CAPTION}}`;
+
+// ─── API Calls ──────────────────────────────────────────────────
 
 /**
- * Call Gemini API with a prompt.
- * @param {string} prompt - The full prompt text
- * @param {number} [temperature=0.3] - Creativity level
- * @returns {string} The model's response text
+ * Call Gemini API with a text prompt.
  */
 function callGemini(prompt, temperature = 0.3) {
+  return callGeminiMultimodal([{ text: prompt }], temperature);
+}
+
+/**
+ * Call Gemini with mixed parts (text + inlineData for audio/images).
+ * @param {Object[]} parts - e.g. [{text:'...'}, {inlineData:{mimeType, data}}]
+ * @param {number} [temperature=0.3]
+ * @returns {string|null}
+ */
+function callGeminiMultimodal(parts, temperature = 0.3) {
   const apiKey = getConfig('GEMINI_API_KEY');
   const model = getConfig('AI_MODEL', 'gemini-2.0-flash');
 
@@ -145,7 +170,7 @@ function callGemini(prompt, temperature = 0.3) {
       method: 'post',
       contentType: 'application/json',
       payload: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
+        contents: [{ parts: parts }],
         generationConfig: {
           temperature: temperature,
           maxOutputTokens: 1024
@@ -171,15 +196,13 @@ function callGemini(prompt, temperature = 0.3) {
 }
 
 /**
- * Call Gemini and parse response as JSON.
- * Strips markdown fences if present.
+ * Call Gemini and parse response as JSON. Strips markdown fences.
  */
 function callGeminiJSON(prompt, temperature = 0.2) {
   const raw = callGemini(prompt, temperature);
   if (!raw) return null;
 
   try {
-    // Strip markdown code fences
     const cleaned = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
     return JSON.parse(cleaned);
   } catch (e) {
@@ -188,12 +211,54 @@ function callGeminiJSON(prompt, temperature = 0.2) {
   }
 }
 
+// ─── Multimodal: Voice & Images ─────────────────────────────────
+
+/**
+ * Transcribe a voice note blob via Gemini.
+ * @param {Blob} blob - Audio blob (typically OGG/Opus from Telegram)
+ * @param {string} [mimeType='audio/ogg']
+ * @returns {string|null} Transcription
+ */
+function transcribeAudio(blob, mimeType = 'audio/ogg') {
+  if (!blob) return null;
+  try {
+    const base64 = Utilities.base64Encode(blob.getBytes());
+    return callGeminiMultimodal([
+      { text: PROMPT_TRANSCRIBE },
+      { inlineData: { mimeType: mimeType, data: base64 } }
+    ], 0.1);
+  } catch (e) {
+    log('Gemini', 'Transcription failed', e.message);
+    return null;
+  }
+}
+
+/**
+ * Analyze an image blob via Gemini vision: extracts text/actionable content.
+ * @param {Blob} blob
+ * @param {string} [caption=''] - User's caption, used as a hint
+ * @returns {string|null}
+ */
+function analyzeImage(blob, caption = '') {
+  if (!blob) return null;
+  try {
+    const base64 = Utilities.base64Encode(blob.getBytes());
+    const prompt = PROMPT_IMAGE_ANALYZE.replace(
+      '{{CAPTION}}',
+      caption ? `User's caption (treat as instruction or context): "${caption}"` : ''
+    );
+    return callGeminiMultimodal([
+      { text: prompt },
+      { inlineData: { mimeType: 'image/jpeg', data: base64 } }
+    ], 0.2);
+  } catch (e) {
+    log('Gemini', 'Image analysis failed', e.message);
+    return null;
+  }
+}
 
 // ─── High-Level Functions ───────────────────────────────────────
 
-/**
- * Categorize and summarize user input.
- */
 function categorizeInput(text) {
   const tz = getConfig('TIMEZONE', 'Europe/Berlin');
   const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
@@ -205,9 +270,6 @@ function categorizeInput(text) {
   return callGeminiJSON(prompt + `\n\nUser input: "${text}"`);
 }
 
-/**
- * Parse a task from natural language.
- */
 function parseTaskText(text) {
   const tz = getConfig('TIMEZONE', 'Europe/Berlin');
   const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
@@ -220,9 +282,6 @@ function parseTaskText(text) {
   return callGeminiJSON(prompt);
 }
 
-/**
- * Parse an event from natural language.
- */
 function parseEventText(text) {
   const tz = getConfig('TIMEZONE', 'Europe/Berlin');
   const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
@@ -235,9 +294,18 @@ function parseEventText(text) {
   return callGeminiJSON(prompt);
 }
 
-/**
- * Generate daily plan.
- */
+function parseGoalText(text) {
+  const tz = getConfig('TIMEZONE', 'Europe/Berlin');
+  const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
+
+  const prompt = PROMPT_PARSE_GOAL
+    .replace('{{DATE}}', dateStr)
+    .replace('{{TIMEZONE}}', tz)
+    .replace('{{TEXT}}', text);
+
+  return callGeminiJSON(prompt);
+}
+
 function generateDailyPlan(events, tasks, goals) {
   const tz = getConfig('TIMEZONE', 'Europe/Berlin');
   const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
@@ -252,9 +320,6 @@ function generateDailyPlan(events, tasks, goals) {
   return callGemini(prompt, 0.7);
 }
 
-/**
- * Generate night review.
- */
 function generateNightReview(completed, incomplete, ideas, events) {
   const tz = getConfig('TIMEZONE', 'Europe/Berlin');
   const dateStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
@@ -269,9 +334,6 @@ function generateNightReview(completed, incomplete, ideas, events) {
   return callGemini(prompt, 0.7);
 }
 
-/**
- * Generate weekly review.
- */
 function generateWeeklyReview(stats) {
   const prompt = PROMPT_WEEKLY_REVIEW
     .replace('{{WEEK_START}}', stats.weekStart)

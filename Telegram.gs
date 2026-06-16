@@ -1,10 +1,14 @@
 /**
- * Telegram.gs
- * Handles all Telegram Bot API communication.
- * Send messages, parse incoming updates, format responses.
+ * Telegram.gs (v2)
+ * All Telegram Bot API communication.
+ * v2 additions: editMessageText, file download (voice/photo),
+ * voice & photo detection in parseTelegramUpdate.
  */
 
 const TELEGRAM_API_BASE = 'https://api.telegram.org/bot';
+const TELEGRAM_FILE_BASE = 'https://api.telegram.org/file/bot';
+
+// ─── Sending ────────────────────────────────────────────────────
 
 /**
  * Send a text message to the configured chat.
@@ -27,8 +31,6 @@ function sendTelegram(text, options = {}) {
     disable_web_page_preview: true,
     ...options
   };
-
-  // Remove parse_mode from payload if explicitly set to null
   if (options.parse_mode === null) delete payload.parse_mode;
 
   try {
@@ -43,9 +45,9 @@ function sendTelegram(text, options = {}) {
     const result = JSON.parse(response.getContentText());
     if (!result.ok) {
       log('Telegram', 'Send failed', result);
-      // Retry without HTML formatting if parse error
+      // Retry without HTML if parse error
       if (result.description && result.description.includes('parse')) {
-        const retryPayload = { ...payload, parse_mode: undefined, text: _stripHtml(text) };
+        const retryPayload = { ...payload, text: _stripHtml(text) };
         delete retryPayload.parse_mode;
         UrlFetchApp.fetch(url, {
           method: 'post',
@@ -62,26 +64,93 @@ function sendTelegram(text, options = {}) {
 
 /**
  * Send a message with inline keyboard buttons.
+ * @param {string} text
+ * @param {Array} buttons - [[{text, callback_data}], ...]
  */
 function sendTelegramWithButtons(text, buttons) {
   sendTelegram(text, {
-    reply_markup: JSON.stringify({
-      inline_keyboard: buttons
-    })
+    reply_markup: JSON.stringify({ inline_keyboard: buttons })
   });
 }
 
 /**
+ * Edit an existing message (used after button presses to update in place).
+ * @param {number} messageId
+ * @param {string} text - New text (HTML)
+ * @param {Object} [options] - e.g. reply_markup for new buttons
+ */
+function editTelegramMessage(messageId, text, options = {}) {
+  const token = getConfig('TELEGRAM_BOT_TOKEN');
+  const chatId = getConfig('TELEGRAM_CHAT_ID');
+  if (!token || !chatId || !messageId) return;
+
+  const payload = {
+    chat_id: chatId,
+    message_id: messageId,
+    text: text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    ...options
+  };
+
+  try {
+    UrlFetchApp.fetch(`${TELEGRAM_API_BASE}${token}/editMessageText`, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    log('Telegram', 'Edit error', e.message);
+    // Fall back to a fresh message so the user always gets feedback
+    sendTelegram(text, options);
+  }
+}
+
+// ─── File download (voice notes, photos) ────────────────────────
+
+/**
+ * Download a Telegram file by file_id.
+ * @param {string} fileId
+ * @returns {Blob|null}
+ */
+function getTelegramFileBlob(fileId) {
+  const token = getConfig('TELEGRAM_BOT_TOKEN');
+  if (!token || !fileId) return null;
+
+  try {
+    const metaResp = UrlFetchApp.fetch(
+      `${TELEGRAM_API_BASE}${token}/getFile?file_id=${encodeURIComponent(fileId)}`,
+      { muteHttpExceptions: true }
+    );
+    const meta = JSON.parse(metaResp.getContentText());
+    if (!meta.ok || !meta.result || !meta.result.file_path) {
+      log('Telegram', 'getFile failed', meta);
+      return null;
+    }
+
+    const fileResp = UrlFetchApp.fetch(
+      `${TELEGRAM_FILE_BASE}${token}/${meta.result.file_path}`,
+      { muteHttpExceptions: true }
+    );
+    return fileResp.getBlob();
+  } catch (e) {
+    log('Telegram', 'File download error', e.message);
+    return null;
+  }
+}
+
+// ─── Parsing incoming updates ───────────────────────────────────
+
+/**
  * Parse an incoming Telegram webhook update.
- * @param {Object} update - The raw update object from doPost
- * @returns {Object} Parsed message: { chatId, text, command, args, isCommand, messageId, from }
+ * Detects: text messages, commands, callback queries, voice notes, photos.
  */
 function parseTelegramUpdate(update) {
-  // Handle regular messages
   const message = update.message || update.edited_message;
-  // Handle callback queries (button presses)
   const callback = update.callback_query;
 
+  // Button press
   if (callback) {
     return {
       chatId: String(callback.message.chat.id),
@@ -90,15 +159,52 @@ function parseTelegramUpdate(update) {
       args: callback.data.startsWith('/') ? callback.data.split(/\s+/).slice(1).join(' ') : callback.data,
       isCommand: callback.data.startsWith('/'),
       isCallback: true,
+      isVoice: false,
+      isPhoto: false,
       callbackId: callback.id,
       messageId: callback.message.message_id,
       from: callback.from
     };
   }
 
-  if (!message || !message.text) {
-    return null;
+  if (!message) return null;
+
+  // Voice note
+  if (message.voice || message.audio) {
+    const media = message.voice || message.audio;
+    return {
+      chatId: String(message.chat.id),
+      text: '',
+      isCommand: false,
+      isCallback: false,
+      isVoice: true,
+      isPhoto: false,
+      fileId: media.file_id,
+      mimeType: media.mime_type || 'audio/ogg',
+      duration: media.duration || 0,
+      messageId: message.message_id,
+      from: message.from
+    };
   }
+
+  // Photo (Telegram sends multiple sizes; last = largest)
+  if (message.photo && message.photo.length) {
+    const largest = message.photo[message.photo.length - 1];
+    return {
+      chatId: String(message.chat.id),
+      text: message.caption || '',
+      isCommand: false,
+      isCallback: false,
+      isVoice: false,
+      isPhoto: true,
+      fileId: largest.file_id,
+      mimeType: 'image/jpeg',
+      messageId: message.message_id,
+      from: message.from
+    };
+  }
+
+  if (!message.text) return null;
 
   const text = message.text.trim();
   const parts = text.split(/\s+/);
@@ -108,17 +214,19 @@ function parseTelegramUpdate(update) {
   return {
     chatId: String(message.chat.id),
     text: text,
-    command: isCommand ? firstWord.split('@')[0] : null, // Remove @botname suffix
+    command: isCommand ? firstWord.split('@')[0] : null,
     args: isCommand ? parts.slice(1).join(' ') : text,
     isCommand: isCommand,
     isCallback: false,
+    isVoice: false,
+    isPhoto: false,
     messageId: message.message_id,
     from: message.from
   };
 }
 
 /**
- * Answer a callback query (acknowledge button press).
+ * Answer a callback query (acknowledge button press, optional toast text).
  */
 function answerCallback(callbackId, text = '') {
   const token = getConfig('TELEGRAM_BOT_TOKEN');
@@ -126,10 +234,7 @@ function answerCallback(callbackId, text = '') {
     UrlFetchApp.fetch(`${TELEGRAM_API_BASE}${token}/answerCallbackQuery`, {
       method: 'post',
       contentType: 'application/json',
-      payload: JSON.stringify({
-        callback_query_id: callbackId,
-        text: text
-      }),
+      payload: JSON.stringify({ callback_query_id: callbackId, text: text }),
       muteHttpExceptions: true
     });
   } catch (e) {
@@ -137,11 +242,8 @@ function answerCallback(callbackId, text = '') {
   }
 }
 
-/**
- * Set the webhook URL for the Telegram bot.
- * Call this once after deploying the Apps Script web app.
- * @param {string} webAppUrl - The deployed Apps Script URL
- */
+// ─── Webhook management ─────────────────────────────────────────
+
 function setTelegramWebhook(webAppUrl) {
   const token = getConfig('TELEGRAM_BOT_TOKEN');
   if (!token) {
@@ -149,8 +251,7 @@ function setTelegramWebhook(webAppUrl) {
     return 'ERROR: No bot token';
   }
 
-  const url = `${TELEGRAM_API_BASE}${token}/setWebhook`;
-  const response = UrlFetchApp.fetch(url, {
+  const response = UrlFetchApp.fetch(`${TELEGRAM_API_BASE}${token}/setWebhook`, {
     method: 'post',
     contentType: 'application/json',
     payload: JSON.stringify({ url: webAppUrl }),
@@ -162,13 +263,11 @@ function setTelegramWebhook(webAppUrl) {
   return result;
 }
 
-/**
- * Remove the webhook (useful for debugging).
- */
 function removeTelegramWebhook() {
   const token = getConfig('TELEGRAM_BOT_TOKEN');
-  const url = `${TELEGRAM_API_BASE}${token}/deleteWebhook`;
-  const response = UrlFetchApp.fetch(url, { method: 'post', muteHttpExceptions: true });
+  const response = UrlFetchApp.fetch(`${TELEGRAM_API_BASE}${token}/deleteWebhook`, {
+    method: 'post', muteHttpExceptions: true
+  });
   return JSON.parse(response.getContentText());
 }
 
@@ -180,26 +279,21 @@ function isAuthorizedChat(chatId) {
   return String(chatId) === String(allowedChatId);
 }
 
-/**
- * Strip HTML tags from text (fallback for parse errors).
- */
+// ─── Formatting helpers ─────────────────────────────────────────
+
 function _stripHtml(text) {
   return text.replace(/<[^>]*>/g, '');
 }
 
-/**
- * Format a task for Telegram display.
- */
 function formatTask(task) {
   const priorityIcon = { high: '🔴', medium: '🟡', low: '🟢' }[task.Priority] || '⚪';
-  const statusIcon = task.Status === 'done' ? '✅' : '📝';
+  const statusIcon = task.Status === 'done' ? '✅'
+    : task.Status === 'in_progress' ? '▶️'
+    : task.Status === 'waiting' ? '⏳' : '📝';
   const due = task.DueDate ? ` (${formatDate(task.DueDate, 'date')})` : '';
   return `${statusIcon} ${priorityIcon} <b>${escapeHtml(task.Title)}</b>${due}\n   <code>${task.ID}</code>`;
 }
 
-/**
- * Format an idea for Telegram display.
- */
 function formatIdea(idea) {
   return `💡 <b>${escapeHtml(truncate(idea.RawContent, 80))}</b>\n   ${idea.Category || 'uncategorized'} · <code>${idea.ID}</code>`;
 }
